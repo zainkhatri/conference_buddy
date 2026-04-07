@@ -8,22 +8,23 @@ const PODS = [
   { id: "jacob-bobby",     bdr: "Jacob", aes: ["Bobby"] },
 ];
 
-// FurtherAI palette — dark theme
+// FurtherAI palette — dark green theme
 const THEME = {
-  bg:        "#0C0C10",
-  surface:   "#13131A",
-  border:    "#1E1E2E",
-  borderHi:  "#2A2A3E",
-  text:      "#F0F0F8",
-  muted:     "#6B6B8A",
-  accent:    "#4AFFC4",   // teal-green from FurtherAI
-  accentDim: "#1A3D33",
+  bg:        "#0B1F14",        // dark forest green
+  surface:   "#0F2B1C",        // slightly lighter green
+  border:    "#1A3D2A",        // muted green border
+  borderHi:  "#245535",        // highlighted border
+  text:      "#F0F0F0",        // white text
+  muted:     "#7A9B8A",        // muted green-gray
+  accent:    "#4AFFC4",        // keep teal-green accent
+  accentDim: "#1A3D33",        // dimmed accent
+  serif:     "'DM Serif Display', serif", // for headings
 };
 
 const POD_COLORS = {
   "zain-nia":        { bg: "#0D2137", border: "#1A4A7A", text: "#60A5FA", label: "Zain / Nia" },
   "dani-mike-gavin": { bg: "#0D2818", border: "#1A5C2E", text: "#4ADE80", label: "Dani / Mike & Gavin" },
-  "jacob-bobby":     { bg: "#2A1A00", border: "#5C3A00", text: "#FBBF24", label: "Jacob / Bobby" },
+  "jacob-bobby":     { bg: "#2A2200", border: "#5C4A00", text: "#FBBF24", label: "Jacob / Bobby" },
 };
 
 const OWNER_PALETTE = [
@@ -68,7 +69,7 @@ function FurtherLogo() {
   return (
     <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
       <rect width="28" height="28" rx="6" fill={THEME.accent} />
-      <path d="M7 8h14v3H10v3h9v3H10v5H7V8z" fill="#0C0C10" />
+      <path d="M7 8h14v3H10v3h9v3H10v5H7V8z" fill="#0B1F14" />
     </svg>
   );
 }
@@ -133,6 +134,42 @@ const inputStyle = {
   fontFamily: "inherit",
 };
 
+// ─── Checkpoint helpers ──────────────────────────────────────────────────────
+const STORAGE_KEY = "conference_enricher_progress";
+
+function saveCheckpoint(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      timestamp: Date.now(),
+      headers: data.headers,
+      colMap: data.colMap,
+      rawRows: data.rawRows,
+      results: data.results,
+      processedIndex: data.processedIndex,
+      hsMap: data.hsMap,
+      hsIdMap: data.hsIdMap,
+    }));
+  } catch (_) {} // localStorage might be full
+}
+
+function loadCheckpoint() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    // Expire after 4 hours
+    if (Date.now() - data.timestamp > 4 * 60 * 60 * 1000) {
+      localStorage.removeItem(STORAGE_KEY);
+      return null;
+    }
+    return data;
+  } catch (_) { return null; }
+}
+
+function clearCheckpoint() {
+  localStorage.removeItem(STORAGE_KEY);
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export default function App() {
   const [step, setStep] = useState(0);
@@ -147,7 +184,14 @@ export default function App() {
   const [errs, setErrs] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [autoDownload, setAutoDownload] = useState(false);
+  const [checkpoint, setCheckpoint] = useState(null);
   const fileRef = useRef();
+
+  // Check for saved progress on mount
+  useEffect(() => {
+    const cp = loadCheckpoint();
+    if (cp) setCheckpoint(cp);
+  }, []);
 
   // ── File upload ──────────────────────────────────────────────────────────────
   const handleFile = useCallback((file) => {
@@ -187,9 +231,11 @@ export default function App() {
     const hsMap = {};
     const hsIdMap = {};
 
+    const enrichStartTime = Date.now();
+
     if (hsKey) {
       try {
-        setProg({ done: 0, total: rawRows.length, msg: "Fetching HubSpot owners..." });
+        setProg({ done: 0, total: rawRows.length, msg: "Fetching HubSpot owners...", startTime: enrichStartTime });
         const ownerRes = await fetch("/api/hubspot/crm/v3/owners?limit=100", {
           headers: { Authorization: `Bearer ${hsKey}` }
         });
@@ -246,16 +292,18 @@ export default function App() {
     }
 
     const total = rawRows.length;
-    const results = [];
+    const results = new Array(total);
     const bdrNames = PODS.map(p => p.bdr);
     let unassignedIdx = 0;
+    const fnCol = headers.find(h => /^first.?name$/i.test(h));
+    const lnCol = headers.find(h => /^last.?name$/i.test(h));
 
-    for (let i = 0; i < total; i++) {
+    // ── Process a single row (Apollo enrichment) ──
+    async function processRow(i) {
       const row = rawRows[i];
       const companyRaw = row[colMap.company] || "";
       const emailCandidate = colMap.email ? row[colMap.email] : "";
       const emailRaw = emailCandidate.includes("@") ? emailCandidate : "";
-      setProg({ done: i, total, msg: `Processing ${i + 1} of ${total.toLocaleString()}...` });
 
       let ownerName = hsKey && companyRaw ? resolveOwner(companyRaw) : null;
       let apolloData = {};
@@ -265,8 +313,6 @@ export default function App() {
           const body = { reveal_personal_emails: true };
           if (emailRaw) body.email = emailRaw;
           if (companyRaw) body.organization_name = companyRaw;
-          const fnCol = headers.find(h => /^first.?name$/i.test(h));
-          const lnCol = headers.find(h => /^last.?name$/i.test(h));
           if (fnCol && lnCol) {
             if (row[fnCol]) body.first_name = row[fnCol];
             if (row[lnCol]) body.last_name = row[lnCol];
@@ -284,14 +330,11 @@ export default function App() {
             const d = await res.json();
             const p = d.person;
             if (p) {
-              console.log(`Apollo [${body.first_name} ${body.last_name}]: email=${p.email}, org_phone=${p.organization?.phone}, phones=${JSON.stringify(p.phone_numbers?.slice(0,2))}`);
               apolloData = {
                 _email: p.email || "",
                 _phone: p.phone_numbers?.[0]?.sanitized_number || p.organization?.phone || "",
                 _linkedin: p.linkedin_url || "",
                 _apollo_title: p.title || "",
-                _seniority: p.seniority || "",
-                _city: p.city || "",
                 _apollo_company: p.organization?.name || "",
               };
               if (!ownerName && apolloData._apollo_company && hsKey) {
@@ -299,31 +342,55 @@ export default function App() {
               }
             }
           }
-          await new Promise(r => setTimeout(r, 200));
         } catch (_) {}
       }
 
-      const podId = ownerName ? podForOwner(ownerName) : null;
-      const unassignedBdr = !ownerName ? bdrNames[unassignedIdx++ % bdrNames.length] : null;
+      return { row, apolloData, ownerName };
+    }
 
-      // Build "Who" value
-      let who = "";
-      if (podId) {
-        const pod = PODS.find(p => p.id === podId);
-        who = pod ? pod.bdr : ownerName;
-      } else if (ownerName) {
-        who = ownerName;
-      } else if (unassignedBdr) {
-        who = unassignedBdr;
+    // ── Run Apollo in parallel batches of 5 ──
+    const CONCURRENCY = 5;
+    let done = 0;
+    for (let batch = 0; batch < total; batch += CONCURRENCY) {
+      const end = Math.min(batch + CONCURRENCY, total);
+      const promises = [];
+      for (let i = batch; i < end; i++) {
+        promises.push(processRow(i).then(r => ({ idx: i, ...r })));
+      }
+      const batchResults = await Promise.all(promises);
+
+      for (const { idx, row, apolloData, ownerName } of batchResults) {
+        const podId = ownerName ? podForOwner(ownerName) : null;
+        const unassignedBdr = !ownerName ? bdrNames[unassignedIdx++ % bdrNames.length] : null;
+        let who = "";
+        if (podId) {
+          const pod = PODS.find(p => p.id === podId);
+          who = pod ? pod.bdr : ownerName;
+        } else if (ownerName) {
+          who = ownerName;
+        } else if (unassignedBdr) {
+          who = unassignedBdr;
+        }
+        results[idx] = {
+          ...row, ...apolloData,
+          _ownerName: ownerName || "",
+          _podId: podId || "",
+          _unassignedBdr: unassignedBdr || "",
+          _who: who,
+        };
       }
 
-      results.push({
-        ...row, ...apolloData,
-        _ownerName: ownerName || "",
-        _podId: podId || "",
-        _unassignedBdr: unassignedBdr || "",
-        _who: who,
-      });
+      done = end;
+      setProg({ done, total, msg: `Processing ${done.toLocaleString()} of ${total.toLocaleString()}...`, startTime: enrichStartTime });
+
+      // Checkpoint every 25 rows
+      if (done % 25 === 0 || done === total) {
+        saveCheckpoint({
+          headers, colMap, rawRows, results: results.filter(Boolean),
+          processedIndex: done,
+          hsMap, hsIdMap,
+        });
+      }
     }
 
     // ── Classification for Membership + Programs/Business Category ──
@@ -334,7 +401,7 @@ export default function App() {
 
     const claudeKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
     if (claudeKey && (needsMembership || needsProg)) {
-      setProg({ done: 0, total, msg: "Classifying with Claude..." });
+      setProg({ done: 0, total, msg: "Classifying with Claude...", startTime: enrichStartTime });
       const BATCH = 30;
       for (let b = 0; b < results.length; b += BATCH) {
         const batch = results.slice(b, b + BATCH);
@@ -387,11 +454,11 @@ export default function App() {
           errors.push(`Claude: ${err.message}`);
           break;
         }
-        setProg({ done: b + batch.length, total, msg: `Classifying ${Math.min(b + batch.length, total)} of ${total}...` });
+        setProg({ done: b + batch.length, total, msg: `Classifying ${Math.min(b + batch.length, total)} of ${total}...`, startTime: enrichStartTime });
       }
     }
 
-    setProg({ done: total, total, msg: "Sorting..." });
+    setProg({ done: total, total, msg: "Sorting...", startTime: enrichStartTime });
 
     const podOrder = PODS.map(p => p.id);
     results.sort((a, b) => {
@@ -411,10 +478,232 @@ export default function App() {
       else if (r._ownerName) s.owners[r._ownerName] = (s.owners[r._ownerName] || 0) + 1;
     });
 
+    // Final checkpoint after sort
+    saveCheckpoint({
+      headers, colMap, rawRows, results,
+      processedIndex: total,
+      hsMap, hsIdMap,
+    });
+
     setStats(s);
     setEnriched(results);
     setErrs(errors);
-    setProg({ done: total, total, msg: "Complete — downloading..." });
+    setProg({ done: total, total, msg: "Complete — downloading...", startTime: enrichStartTime });
+    setAutoDownload(true);
+    setStep(3);
+  }
+
+  // ── Resume enrichment from checkpoint ────────────────────────────────────────
+  async function resumeEnrichment(cp) {
+    const errors = [];
+    const hsMap = { ...cp.hsMap };
+    const hsIdMap = { ...cp.hsIdMap };
+    const resumeStartTime = Date.now();
+
+    function lookup(name) {
+      const norm = normalize(name);
+      if (hsMap[norm]) return hsMap[norm];
+      for (const [k, v] of Object.entries(hsMap)) {
+        if (k.length > 3 && (norm.includes(k) || k.includes(norm))) return v;
+      }
+      return null;
+    }
+
+    function resolveOwner(name) {
+      let entry = lookup(name);
+      if (!entry) return null;
+      let hops = 0;
+      while (entry && !entry.ownerName && entry.parentId && hops < 3) {
+        const pNorm = hsIdMap[entry.parentId];
+        entry = pNorm ? hsMap[pNorm] : null;
+        hops++;
+      }
+      return entry?.ownerName || null;
+    }
+
+    const total = cp.rawRows.length;
+    const results = [...cp.results];
+    const bdrNames = PODS.map(p => p.bdr);
+    let unassignedIdx = cp.results.filter(r => r._unassignedBdr).length;
+
+    for (let i = cp.processedIndex; i < total; i++) {
+      const row = cp.rawRows[i];
+      const companyRaw = row[cp.colMap.company] || "";
+      const emailCandidate = cp.colMap.email ? row[cp.colMap.email] : "";
+      const emailRaw = emailCandidate.includes("@") ? emailCandidate : "";
+      setProg({ done: i, total, msg: `Processing ${i + 1} of ${total.toLocaleString()}...`, startTime: resumeStartTime });
+
+      let ownerName = hsKey && companyRaw ? resolveOwner(companyRaw) : null;
+      let apolloData = {};
+
+      if (apKey) {
+        try {
+          const body = { reveal_personal_emails: true };
+          if (emailRaw) body.email = emailRaw;
+          if (companyRaw) body.organization_name = companyRaw;
+          const fnCol = cp.headers.find(h => /^first.?name$/i.test(h));
+          const lnCol = cp.headers.find(h => /^last.?name$/i.test(h));
+          if (fnCol && lnCol) {
+            if (row[fnCol]) body.first_name = row[fnCol];
+            if (row[lnCol]) body.last_name = row[lnCol];
+          } else if (cp.colMap.name && row[cp.colMap.name]) {
+            const parts = row[cp.colMap.name].trim().split(" ");
+            if (parts[0]) body.first_name = parts[0];
+            if (parts[1]) body.last_name = parts.slice(1).join(" ");
+          }
+          const res = await fetch("/api/apollo/v1/people/match", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Api-Key": apKey },
+            body: JSON.stringify(body),
+          });
+          if (res.ok) {
+            const d = await res.json();
+            const p = d.person;
+            if (p) {
+              apolloData = {
+                _email: p.email || "",
+                _phone: p.phone_numbers?.[0]?.sanitized_number || p.organization?.phone || "",
+                _linkedin: p.linkedin_url || "",
+                _apollo_title: p.title || "",
+                _seniority: p.seniority || "",
+                _city: p.city || "",
+                _apollo_company: p.organization?.name || "",
+              };
+              if (!ownerName && apolloData._apollo_company && hsKey) {
+                ownerName = resolveOwner(apolloData._apollo_company);
+              }
+            }
+          }
+          await new Promise(r => setTimeout(r, 100));
+        } catch (_) {}
+      }
+
+      const podId = ownerName ? podForOwner(ownerName) : null;
+      const unassignedBdr = !ownerName ? bdrNames[unassignedIdx++ % bdrNames.length] : null;
+
+      let who = "";
+      if (podId) {
+        const pod = PODS.find(p => p.id === podId);
+        who = pod ? pod.bdr : ownerName;
+      } else if (ownerName) {
+        who = ownerName;
+      } else if (unassignedBdr) {
+        who = unassignedBdr;
+      }
+
+      results.push({
+        ...row, ...apolloData,
+        _ownerName: ownerName || "",
+        _podId: podId || "",
+        _unassignedBdr: unassignedBdr || "",
+        _who: who,
+      });
+
+      // Checkpoint every 25 rows
+      if ((i + 1) % 25 === 0 || i === total - 1) {
+        saveCheckpoint({
+          headers: cp.headers, colMap: cp.colMap, rawRows: cp.rawRows, results,
+          processedIndex: i + 1,
+          hsMap, hsIdMap,
+        });
+      }
+    }
+
+    // Claude classification
+    const memberCol = cp.headers.find(h => /membership|member.?type/i.test(h));
+    const needsMembership = !memberCol || results.every(r => !r[memberCol]);
+    const progCol = cp.headers.find(h => /program|business.?cat|category/i.test(h));
+    const needsProg = !progCol || results.every(r => !r[progCol]);
+
+    const claudeKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
+    if (claudeKey && (needsMembership || needsProg)) {
+      setProg({ done: 0, total, msg: "Classifying with Claude...", startTime: resumeStartTime });
+      const BATCH = 30;
+      for (let b = 0; b < results.length; b += BATCH) {
+        const batch = results.slice(b, b + BATCH);
+        const lines = batch.map((r, idx) =>
+          `${idx + 1}. Company: "${r[cp.colMap.company] || ""}" | Title: "${cp.colMap.title ? r[cp.colMap.title] : (r._apollo_title || "")}"`
+        ).join("\n");
+
+        const classifyFields = [];
+        if (needsMembership) classifyFields.push('"Membership" (one of: Carrier, Program Administrator, Other)');
+        if (needsProg) classifyFields.push('"Category" (one of: Carrier, Program Administrator, MGA, Reinsurer, Broker, Technology/Vendor, Consultant, Other)');
+
+        try {
+          const res = await fetch("/api/anthropic/v1/messages", {
+            method: "POST",
+            headers: {
+              "x-api-key": claudeKey,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              model: "claude-haiku-4-5-20251001",
+              max_tokens: 4096,
+              messages: [{
+                role: "user",
+                content: `You are classifying insurance industry companies. For each numbered company below, provide ${classifyFields.join(" and ")}.\n\nReply with ONLY numbered lines in this exact format:\n1. Membership | Category\n2. Membership | Category\n\nCompanies:\n${lines}`
+              }],
+            }),
+          });
+          if (res.ok) {
+            const d = await res.json();
+            const text = d.content?.[0]?.text || "";
+            text.split("\n").forEach(line => {
+              const m = line.match(/^(\d+)\.\s*(.+)/);
+              if (m) {
+                const idx = parseInt(m[1]) - 1;
+                if (idx >= 0 && idx < batch.length) {
+                  const parts = m[2].split("|").map(s => s.trim());
+                  if (needsMembership && parts[0]) batch[idx]._membership = parts[0];
+                  if (needsProg && parts[needsMembership ? 1 : 0]) batch[idx]._bizCategory = parts[needsMembership ? 1 : 0];
+                }
+              }
+            });
+          } else {
+            const errBody = await res.text().catch(() => "");
+            errors.push(`Claude ${res.status}: ${errBody.slice(0, 100)}`);
+            break;
+          }
+        } catch (err) {
+          errors.push(`Claude: ${err.message}`);
+          break;
+        }
+        setProg({ done: b + batch.length, total, msg: `Classifying ${Math.min(b + batch.length, total)} of ${total}...`, startTime: resumeStartTime });
+      }
+    }
+
+    setProg({ done: total, total, msg: "Sorting...", startTime: resumeStartTime });
+
+    const podOrder = PODS.map(p => p.id);
+    results.sort((a, b) => {
+      const sa = a._unassignedBdr ? 999 : a._podId ? podOrder.indexOf(a._podId) : 100;
+      const sb = b._unassignedBdr ? 999 : b._podId ? podOrder.indexOf(b._podId) : 100;
+      if (sa !== sb) return sa - sb;
+      if (sa === 999) return bdrNames.indexOf(a._unassignedBdr) - bdrNames.indexOf(b._unassignedBdr);
+      if (sa === 100) return (a._ownerName || "").localeCompare(b._ownerName || "");
+      return 0;
+    });
+
+    const s = { pods: {}, owners: {}, unassigned: 0 };
+    PODS.forEach(p => { s.pods[p.id] = 0; });
+    results.forEach(r => {
+      if (r._unassignedBdr) s.unassigned++;
+      else if (r._podId) s.pods[r._podId]++;
+      else if (r._ownerName) s.owners[r._ownerName] = (s.owners[r._ownerName] || 0) + 1;
+    });
+
+    // Final checkpoint
+    saveCheckpoint({
+      headers: cp.headers, colMap: cp.colMap, rawRows: cp.rawRows, results,
+      processedIndex: total,
+      hsMap, hsIdMap,
+    });
+
+    setStats(s);
+    setEnriched(results);
+    setErrs(errors);
+    setProg({ done: total, total, msg: "Complete — downloading...", startTime: resumeStartTime });
     setAutoDownload(true);
     setStep(3);
   }
@@ -550,6 +839,7 @@ export default function App() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    clearCheckpoint();
   }
 
   // Auto-download when enrichment finishes
@@ -572,7 +862,7 @@ export default function App() {
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <FurtherLogo />
             <div>
-              <span style={{ fontSize: 15, fontWeight: 700, color: THEME.text, letterSpacing: "-0.01em" }}>FurtherAI</span>
+              <span style={{ fontSize: 15, fontWeight: 700, color: THEME.text, letterSpacing: "-0.01em", fontFamily: THEME.serif }}>FurtherAI</span>
               <span style={{ fontSize: 13, color: THEME.muted, marginLeft: 8 }}>/ Conference List Enricher</span>
             </div>
           </div>
@@ -594,7 +884,43 @@ export default function App() {
         <StepBar current={step} />
 
         {/* ── Step 0: Upload ── */}
-        {step === 0 && (
+        {step === 0 && (<>
+          {checkpoint && (
+            <div style={{ background: THEME.surface, border: `1px solid ${THEME.accent}44`, borderRadius: 12, padding: "16px 20px", marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: THEME.text, fontFamily: THEME.serif }}>Resume previous session?</div>
+                <div style={{ fontSize: 12, color: THEME.muted, marginTop: 4 }}>{checkpoint.results.length} of {checkpoint.rawRows.length} rows processed</div>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => {
+                  setHeaders(checkpoint.headers);
+                  setColMap(checkpoint.colMap);
+                  setRawRows(checkpoint.rawRows);
+                  setEnriched(checkpoint.results);
+                  if (checkpoint.processedIndex >= checkpoint.rawRows.length) {
+                    const s = { pods: {}, owners: {}, unassigned: 0 };
+                    PODS.forEach(p => { s.pods[p.id] = 0; });
+                    checkpoint.results.forEach(r => {
+                      if (r._unassignedBdr) s.unassigned++;
+                      else if (r._podId) s.pods[r._podId]++;
+                      else if (r._ownerName) s.owners[r._ownerName] = (s.owners[r._ownerName] || 0) + 1;
+                    });
+                    setStats(s);
+                    setStep(3);
+                    setAutoDownload(true);
+                  } else {
+                    setStep(2);
+                    resumeEnrichment(checkpoint);
+                  }
+                }} style={{ padding: "8px 18px", borderRadius: 8, border: "none", background: THEME.accent, color: THEME.bg, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                  Resume
+                </button>
+                <button onClick={() => { clearCheckpoint(); setCheckpoint(null); }} style={{ padding: "8px 18px", borderRadius: 8, border: `1px solid ${THEME.border}`, background: "transparent", color: THEME.muted, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+                  Start fresh
+                </button>
+              </div>
+            </div>
+          )}
           <div
             onDrop={onDrop}
             onDragOver={e => { e.preventDefault(); setDragOver(true); }}
@@ -610,7 +936,7 @@ export default function App() {
             <div style={{ width: 52, height: 52, borderRadius: 12, background: THEME.accentDim, border: `1px solid ${THEME.accent}33`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px", fontSize: 24 }}>
               📋
             </div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: THEME.text, marginBottom: 8, letterSpacing: "-0.02em" }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: THEME.text, marginBottom: 8, letterSpacing: "-0.02em", fontFamily: THEME.serif }}>
               Drop your attendee file here
             </div>
             <div style={{ fontSize: 13, color: THEME.muted, marginBottom: 20 }}>
@@ -621,12 +947,12 @@ export default function App() {
             </div>
             <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{ display: "none" }} onChange={onDrop} />
           </div>
-        )}
+        </>)}
 
         {/* ── Step 1: Column map ── */}
         {step === 1 && (
           <div style={{ background: THEME.surface, borderRadius: 16, border: `1px solid ${THEME.border}`, padding: 28 }}>
-            <div style={{ fontSize: 16, fontWeight: 700, color: THEME.text, marginBottom: 4, letterSpacing: "-0.02em" }}>Map your columns</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: THEME.text, marginBottom: 4, letterSpacing: "-0.02em", fontFamily: THEME.serif }}>Map your columns</div>
             <div style={{ fontSize: 13, color: THEME.muted, marginBottom: 24 }}>{rawRows.length.toLocaleString()} rows detected. We auto-mapped what we could — fix anything that's off.</div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 22 }}>
@@ -674,11 +1000,19 @@ export default function App() {
           <div style={{ background: THEME.surface, borderRadius: 16, border: `1px solid ${THEME.border}`, padding: 48, textAlign: "center" }}>
             <div style={{ width: 48, height: 48, borderRadius: "50%", border: `3px solid ${THEME.accentDim}`, borderTop: `3px solid ${THEME.accent}`, margin: "0 auto 24px", animation: "spin 1s linear infinite" }} />
             <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-            <div style={{ fontSize: 15, fontWeight: 700, color: THEME.text, marginBottom: 20, letterSpacing: "-0.01em" }}>{prog.msg}</div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: THEME.text, marginBottom: 20, letterSpacing: "-0.01em", fontFamily: THEME.serif }}>{prog.msg}</div>
             <div style={{ background: THEME.bg, borderRadius: 999, height: 4, overflow: "hidden", maxWidth: 380, margin: "0 auto 12px", border: `1px solid ${THEME.border}` }}>
               <div style={{ background: THEME.accent, height: "100%", width: `${pct}%`, borderRadius: 999, transition: "width 0.4s ease" }} />
             </div>
             <div style={{ fontSize: 13, color: THEME.muted }}>{prog.done.toLocaleString()} / {prog.total.toLocaleString()} rows</div>
+            <div style={{ fontSize: 12, color: THEME.muted, marginTop: 4 }}>
+              {prog.done > 5 && prog.total > prog.done && prog.startTime && (() => {
+                const elapsed = (Date.now() - prog.startTime) / 1000;
+                const rate = prog.done / elapsed;
+                const remaining = Math.round((prog.total - prog.done) / rate / 60);
+                return `~${remaining} min remaining`;
+              })()}
+            </div>
           </div>
         )}
 
@@ -774,6 +1108,7 @@ export default function App() {
                 Download XLSX
               </button>
               <button onClick={() => {
+                clearCheckpoint(); setCheckpoint(null);
                 setStep(0); setRawRows([]); setEnriched([]); setStats(null);
                 setErrs([]); setProg({ done: 0, total: 0, msg: "" }); setAutoDownload(false);
                 palIdx = 0; Object.keys(palCache).forEach(k => delete palCache[k]);
