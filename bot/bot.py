@@ -202,48 +202,63 @@ def apollo_org_news(domain, cache):
 # ─── Claude: single-sentence personalization hook ───
 def claude_generate_hook(row, news_items):
     """Generate one short personalization sentence for a contact given Apollo signals.
-    Returns empty string if no meaningful signal."""
+    Returns empty string if no meaningful signal or if model output is a refusal."""
     if not ANTHROPIC_API_KEY: return ""
-    role_started = row.get("_role_started", "")
     tenure = row.get("_tenure_months")
     title = row.get("Job Title", "") or row.get("_apollo_title", "")
     company = row.get("Company", "")
-    angle = row.get("Outreach Angle", "")
 
-    # Need at least ONE concrete signal
-    if not role_started and not news_items and tenure is None: return ""
+    recent_role = tenure is not None and tenure <= 12
+    has_news = bool(news_items)
+    if not recent_role and not has_news: return ""
 
-    context_lines = []
-    if title and company: context_lines.append(f"Role: {title} at {company}")
-    if role_started: context_lines.append(f"Started current role: {role_started}")
-    if tenure is not None: context_lines.append(f"Tenure: {tenure} months in current role")
-    if news_items: context_lines.append("Recent company news:\n- " + "\n- ".join(news_items[:3]))
-    if angle: context_lines.append(f"Outreach angle: {angle}")
+    ctx = []
+    if title and company: ctx.append(f"Role: {title} at {company}")
+    if recent_role:
+        ctx.append(f"SIGNAL: Started this role {tenure} months ago. This IS the hook — under 12 months is significant.")
+    if has_news:
+        ctx.append("Recent company news:\n- " + "\n- ".join(news_items[:3]))
 
     prompt = (
-        "You are writing a 1-sentence personalization hook for a cold email to this person. "
-        "Reference ONE concrete, specific thing — either (a) a recent company news event, or (b) their recent role change if < 12 months. "
-        "NEVER narrate title or tenure generically (\"X years at Y\" is lazy). "
-        "The sentence should read as if you noticed something specific. "
-        "Return ONLY the single sentence, no quotes, no preamble, under 20 words. "
-        "If nothing concrete to reference, return an empty string.\n\n"
-        + "\n".join(context_lines)
+        "Write ONE sentence for the opening of a cold email. Reference the signal.\n\n"
+        "RULES:\n"
+        "- Output ONLY the sentence. No preamble, no apology, no explanation.\n"
+        "- Under 20 words. Conversational, not salesy.\n"
+        "- No em-dashes or semicolons. No specific dates (say 'three months in', not '2025-11-01').\n"
+        "- Do NOT narrate generic tenure like 'X years at Y'.\n\n"
+        "GOOD EXAMPLES:\n"
+        "- Stepping into the CIO seat at Westfield in your first few months is a lot on your plate.\n"
+        "- Three months into the Chief Underwriting role is about when the ops gaps start to scream.\n"
+        "- Congrats on the Series B — the growth is going to push submission volume hard.\n\n"
+        "BAD (do not do this):\n"
+        "- I don't have enough information...\n"
+        "- Without concrete details I cannot...\n\n"
+        "SIGNALS:\n"
+        + "\n".join(ctx)
+        + "\n\nOutput the sentence only:"
     )
+
     try:
         r = req.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 120, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 100, "messages": [{"role": "user", "content": prompt}]},
             timeout=15,
         )
-        if r.ok:
-            text = (r.json().get("content", [{}])[0].get("text", "") or "").strip()
-            # Strip surrounding quotes if any
-            text = re.sub(r'^["\']|["\']$', '', text).strip()
-            # Reject generic fallbacks
-            if len(text) < 8 or text.lower() in ("", "none", "n/a", "no concrete signal"):
-                return ""
-            return text
+        if not r.ok: return ""
+        text = (r.json().get("content", [{}])[0].get("text", "") or "").strip()
+        text = re.sub(r'^["\']|["\']$', '', text).strip()
+        lower = text.lower()
+        refusal_markers = [
+            "i don't", "i do not", "i cannot", "i can't", "i'm unable",
+            "i have no", "i lack", "without concrete", "without verified",
+            "without specific", "returning empty", "cannot write", "cannot create",
+            "cannot provide", "not enough information", "insufficient information",
+            "i need more", "based on the information", "here is", "here's",
+        ]
+        if any(m in lower for m in refusal_markers): return ""
+        if len(text) < 12 or len(text.split()) < 4 or len(text.split()) > 35: return ""
+        return text
     except Exception:
         return ""
     return ""
