@@ -18,6 +18,9 @@ DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 HUBSPOT_TOKEN = os.environ.get("HUBSPOT_TOKEN", "")
 APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# FurtherAI outbound pipeline — push enriched contacts so automated email can draft + send
+FURTHERAI_PIPELINE_URL = os.environ.get("FURTHERAI_PIPELINE_URL", "https://autoemail-nine.vercel.app/api/schedule?conference_import=1")
+FURTHERAI_CRON_SECRET = os.environ.get("FURTHERAI_CRON_SECRET", "")
 
 app = App(token=SLACK_BOT_TOKEN)
 import time
@@ -148,8 +151,142 @@ def apollo_match(row, domain_cache):
                 org = person.get("organization", {})
                 if org.get("primary_domain") and norm_co:
                     domain_cache[norm_co] = org["primary_domain"]
+                # Employment history → role_started + tenure_months (for personalization hook)
+                emp = person.get("employment_history") or []
+                # Current role = first entry where end_date is null/missing
+                current = next((e for e in emp if not e.get("end_date")), emp[0] if emp else None)
+                if current and current.get("start_date"):
+                    sd = current["start_date"]  # "YYYY-MM" or "YYYY-MM-DD"
+                    row["_role_started"] = sd
+                    # Compute tenure in months from start_date to today
+                    try:
+                        from datetime import datetime
+                        parts = sd.split("-")
+                        y, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 1
+                        now = datetime.utcnow()
+                        months = (now.year - y) * 12 + (now.month - m)
+                        row["_tenure_months"] = max(0, months)
+                    except Exception:
+                        pass
     except: pass
     time.sleep(0.1)
+
+# ─── Apollo: company news enrichment (cached per domain) ───
+def apollo_org_news(domain, cache):
+    """Return a short list of recent news headlines for a company by domain.
+    Uses Apollo's news_articles/search endpoint. Cache by domain to save credits."""
+    if not APOLLO_API_KEY or not domain: return []
+    if domain in cache: return cache[domain]
+    headers = {"Content-Type": "application/json", "X-Api-Key": APOLLO_API_KEY, "Cache-Control": "no-cache"}
+    try:
+        r = req.post(
+            "https://api.apollo.io/v1/news_articles/search",
+            headers=headers,
+            json={"q_organization_domains": domain, "page": 1, "per_page": 5},
+            timeout=10,
+        )
+        items = []
+        if r.ok:
+            for n in (r.json().get("news_articles") or [])[:3]:
+                title = (n.get("title") or "").strip()
+                pub = (n.get("publication_date") or "")[:10]
+                if title:
+                    items.append(f"{title} ({pub})" if pub else title)
+        cache[domain] = items
+        time.sleep(0.1)
+        return items
+    except Exception:
+        cache[domain] = []
+        return []
+
+# ─── Claude: single-sentence personalization hook ───
+def claude_generate_hook(row, news_items):
+    """Generate one short personalization sentence for a contact given Apollo signals.
+    Returns empty string if no meaningful signal."""
+    if not ANTHROPIC_API_KEY: return ""
+    role_started = row.get("_role_started", "")
+    tenure = row.get("_tenure_months")
+    title = row.get("Job Title", "") or row.get("_apollo_title", "")
+    company = row.get("Company", "")
+    angle = row.get("Outreach Angle", "")
+
+    # Need at least ONE concrete signal
+    if not role_started and not news_items and tenure is None: return ""
+
+    context_lines = []
+    if title and company: context_lines.append(f"Role: {title} at {company}")
+    if role_started: context_lines.append(f"Started current role: {role_started}")
+    if tenure is not None: context_lines.append(f"Tenure: {tenure} months in current role")
+    if news_items: context_lines.append("Recent company news:\n- " + "\n- ".join(news_items[:3]))
+    if angle: context_lines.append(f"Outreach angle: {angle}")
+
+    prompt = (
+        "You are writing a 1-sentence personalization hook for a cold email to this person. "
+        "Reference ONE concrete, specific thing — either (a) a recent company news event, or (b) their recent role change if < 12 months. "
+        "NEVER narrate title or tenure generically (\"X years at Y\" is lazy). "
+        "The sentence should read as if you noticed something specific. "
+        "Return ONLY the single sentence, no quotes, no preamble, under 20 words. "
+        "If nothing concrete to reference, return an empty string.\n\n"
+        + "\n".join(context_lines)
+    )
+    try:
+        r = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 120, "messages": [{"role": "user", "content": prompt}]},
+            timeout=15,
+        )
+        if r.ok:
+            text = (r.json().get("content", [{}])[0].get("text", "") or "").strip()
+            # Strip surrounding quotes if any
+            text = re.sub(r'^["\']|["\']$', '', text).strip()
+            # Reject generic fallbacks
+            if len(text) < 8 or text.lower() in ("", "none", "n/a", "no concrete signal"):
+                return ""
+            return text
+    except Exception:
+        return ""
+    return ""
+
+# ─── Push to FurtherAI outbound pipeline ───
+def push_to_furtherai(data, conference_name):
+    """POST enriched contacts to FurtherAI /api/schedule?conference_import=1.
+    Returns (ok, response_json)."""
+    if not FURTHERAI_CRON_SECRET:
+        return False, {"error": "FURTHERAI_CRON_SECRET not configured"}
+    contacts = []
+    for r in data:
+        email = (r.get("_email") or r.get("Email") or "").strip().lower()
+        if not email or "@" not in email: continue
+        if r.get("Outreach Priority") == "4 - Do Not Contact": continue  # DNC
+        sig = {}
+        if r.get("_suggested_hook"): sig["suggested_hook"] = r["_suggested_hook"]
+        if r.get("_role_started"): sig["role_started"] = r["_role_started"]
+        if r.get("_tenure_months") is not None: sig["tenure_months"] = r["_tenure_months"]
+        if r.get("_recent_news"): sig["recent_news"] = r["_recent_news"]
+        contacts.append({
+            "email": email,
+            "first_name": r.get("First Name", ""),
+            "last_name": r.get("Last Name", ""),
+            "company": r.get("Company", ""),
+            "title": r.get("Job Title", "") or r.get("_apollo_title", ""),
+            "apollo_signals": sig,
+            "outreach_angle": r.get("Outreach Angle", ""),
+            "priority": r.get("Outreach Priority", ""),
+            "pod_owner": r.get("Who", ""),
+        })
+    if not contacts:
+        return False, {"error": "no contacts with email + not-DNC"}
+    try:
+        r = req.post(
+            FURTHERAI_PIPELINE_URL,
+            headers={"Authorization": f"Bearer {FURTHERAI_CRON_SECRET}", "Content-Type": "application/json"},
+            json={"conference_name": conference_name, "contacts": contacts},
+            timeout=90,
+        )
+        return r.ok, (r.json() if r.ok else {"error": r.text[:500]})
+    except Exception as e:
+        return False, {"error": str(e)[:200]}
 
 # ─── Claude Classification ───
 COMPANY_TYPES = ["Insurance Carrier", "MGA / Specialty Underwriter", "Insurance Broker",
@@ -634,8 +771,40 @@ def process_csv(csv_text, filename, progress_fn=None):
         if not r.get("Outreach Angle", "").strip() and r.get("Outreach Priority") != "4 - Do Not Contact":
             r["Outreach Angle"] = "Introduce FurtherAI's insurance ops AI platform — explore relevance to their business"
 
+    # ── Step 5.5: Company news pass (one call per unique domain, cached) ──
+    # Only for contacts not flagged DNC and that have a domain from Apollo
+    news_cache = {}
+    needs_news = [r for r in data if r.get("Outreach Priority") != "4 - Do Not Contact"]
+    if APOLLO_API_KEY and needs_news:
+        log(f"Apollo news: pulling for {len(set(domain_cache.values()))} unique domains...")
+        for r in needs_news:
+            norm_co = normalize_company(r.get("Company", ""))
+            domain = domain_cache.get(norm_co, "")
+            if not domain: continue
+            items = apollo_org_news(domain, news_cache)
+            if items: r["_recent_news"] = items
+
+    # ── Step 5.6: Suggested hook generation (one Claude Haiku call per contact with a signal) ──
+    if ANTHROPIC_API_KEY:
+        needs_hook = [r for r in data if r.get("Outreach Priority") != "4 - Do Not Contact"
+                      and (r.get("_role_started") or r.get("_recent_news"))]
+        log(f"Generating hooks for {len(needs_hook)} contacts...")
+        for i, r in enumerate(needs_hook):
+            hook = claude_generate_hook(r, r.get("_recent_news", []))
+            if hook: r["_suggested_hook"] = hook
+            if (i + 1) % 25 == 0: log(f"Hooks: {i+1}/{len(needs_hook)}")
+
+    # Surface hook + tenure + news to visible columns for BDRs
+    for r in data:
+        if r.get("_suggested_hook"): r["Suggested Hook"] = r["_suggested_hook"]
+        if r.get("_role_started"): r["Role Started"] = r["_role_started"]
+        if r.get("_tenure_months") is not None: r["Tenure (months)"] = str(r["_tenure_months"])
+        if r.get("_recent_news"): r["Recent Company News"] = " | ".join(r["_recent_news"][:2])
+
     # ── Build output headers ──
-    icp_cols = ["Company Type", "Seniority", "Outreach Priority", "ICP Fit", "ICP Reason", "Outreach Angle", "HubSpot Status", "HubSpot Owner", "Who"]
+    icp_cols = ["Company Type", "Seniority", "Outreach Priority", "ICP Fit", "ICP Reason", "Outreach Angle",
+                "Role Started", "Tenure (months)", "Recent Company News", "Suggested Hook",
+                "HubSpot Status", "HubSpot Owner", "Who"]
     headers = list(orig_headers)
     for col in icp_cols:
         if col not in headers:
@@ -653,7 +822,19 @@ def process_csv(csv_text, filename, progress_fn=None):
 
     log("Pushing to Google Sheets...")
     url, pod, rr, dnc = push_to_sheets(data, headers, sheet_name)
-    return url, len(data), pod, rr, dnc
+
+    # ── Step 6: Push to FurtherAI outbound pipeline (opt-in via env) ──
+    pipeline_result = None
+    if FURTHERAI_CRON_SECRET:
+        log("Pushing enriched contacts to FurtherAI pipeline...")
+        ok, resp = push_to_furtherai(data, name)
+        if ok:
+            pipeline_result = resp
+            log(f"Pipeline: imported={resp.get('imported', 0)} skipped_customer={resp.get('skipped_customer', 0)} skipped_no_signal={resp.get('skipped_no_signal', 0)}")
+        else:
+            log(f"Pipeline push failed: {resp.get('error', 'unknown')[:120]}")
+
+    return url, len(data), pod, rr, dnc, pipeline_result
 
 # ─── Slack Event: File Shared ───
 @app.event("file_shared")
@@ -706,10 +887,10 @@ def handle_file_shared(event, client, say):
         except: pass
 
     try:
-        # Process — full pipeline (Apollo + HubSpot + Claude + ICP)
-        sheet_url, total, pod, rr, dnc = process_csv(csv_text, filename, progress_fn=progress)
+        # Process — full pipeline (Apollo + HubSpot + Claude + ICP + FurtherAI push if enabled)
+        sheet_url, total, pod, rr, dnc, pipeline_result = process_csv(csv_text, filename, progress_fn=progress)
 
-        say(channel=channel, blocks=[
+        blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *{filename}* processed!"}},
             {"type": "section", "text": {"type": "mrkdwn", "text":
                 f"*{total}* contacts\n"
@@ -718,7 +899,16 @@ def handle_file_shared(event, client, say):
                 f":red_circle: Do Not Contact: *{dnc}*"
             }},
             {"type": "section", "text": {"type": "mrkdwn", "text": f":bar_chart: <{sheet_url}|Open in Google Sheets>"}},
-        ])
+        ]
+        if pipeline_result:
+            imp = pipeline_result.get("imported", 0)
+            skc = pipeline_result.get("skipped_customer", 0)
+            ske = pipeline_result.get("skipped_existing", 0)
+            sks = pipeline_result.get("skipped_no_signal", 0)
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
+                f":mailbox_with_mail: *FurtherAI pipeline*: imported {imp} · skipped {skc} customer, {ske} existing, {sks} no-signal (sequences paused for review)"
+            }})
+        say(channel=channel, blocks=blocks)
     except Exception as e:
         say(channel=channel, text=f":x: Error processing *{filename}*: {str(e)[:200]}")
 
