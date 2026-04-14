@@ -269,11 +269,14 @@ def push_to_furtherai(data, conference_name):
     Returns (ok, response_json)."""
     if not FURTHERAI_CRON_SECRET:
         return False, {"error": "FURTHERAI_CRON_SECRET not configured"}
+    INSURANCE_TYPES = {"Insurance Carrier", "MGA / Specialty Underwriter", "Insurance Broker",
+                        "TPA / Claims Admin", "Reinsurer", "Captive / Risk Finance"}
     contacts = []
     for r in data:
         email = (r.get("_email") or r.get("Email") or "").strip().lower()
         if not email or "@" not in email: continue
         if r.get("Outreach Priority") == "4 - Do Not Contact": continue  # DNC
+        if r.get("Company Type", "") not in INSURANCE_TYPES: continue  # non-insurance filter
         sig = {}
         if r.get("_suggested_hook"): sig["suggested_hook"] = r["_suggested_hook"]
         if r.get("_role_started"): sig["role_started"] = r["_role_started"]
