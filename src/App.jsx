@@ -570,16 +570,19 @@ export default function App() {
         setProg(p => ({ ...p, msg: "Fetching HubSpot companies..." }));
         let after = null, fetched = 0;
         while (true) {
-          const url = `/api/hubspot/crm/v3/objects/companies?limit=100&properties=name,domain,hubspot_owner_id,parent_company_id,lifecyclestage,hs_lead_status,icp_tier,category${after ? `&after=${after}` : ""}`;
+          // Parent relationship is a HubSpot association, not a property — pull it inline.
+          const url = `/api/hubspot/crm/v3/objects/companies?limit=100&associations=companies&properties=name,domain,hubspot_owner_id,lifecyclestage,hs_lead_status,icp_tier,category${after ? `&after=${after}` : ""}`;
           const res = await fetch(url, { headers: { Authorization: `Bearer ${hsKey}` } });
           if (!res.ok) { errors.push(`HubSpot ${res.status}: ${res.statusText}`); break; }
           const d = await res.json();
           (d.results || []).forEach(c => {
             const norm = normalize(c.properties?.name);
+            const parentAssoc = (c.associations?.companies?.results || [])
+              .find(a => a.type === "child_to_parent_company");
             const entry = {
               ownerName: ownerMap[c.properties?.hubspot_owner_id] || null,
               id: c.id,
-              parentId: c.properties?.parent_company_id || null,
+              parentId: parentAssoc?.id || null,
               lifecycle: c.properties?.lifecyclestage || "",
               leadStatus: c.properties?.hs_lead_status || "",
               icpTier: (c.properties?.icp_tier || "").toLowerCase(),
@@ -617,18 +620,16 @@ export default function App() {
     function resolveEntry(name, domain) {
       const entry = lookup(name, domain);
       if (!entry) return null;
-      // Fill missing ownerName / icpTier / category from parent chain
+      // Inherit ownerName only — category/tier are per-company and differ between
+      // parent and child (e.g., TPA subsidiary of a broker). Child values always win.
       const filled = { ...entry };
       let cursor = entry;
       let hops = 0;
-      while (hops < 3 && cursor && cursor.parentId &&
-             (!filled.ownerName || !filled.icpTier || !filled.category)) {
+      while (hops < 3 && cursor && cursor.parentId && !filled.ownerName) {
         const pNorm = hsIdMap[cursor.parentId];
         const parent = pNorm ? hsMap[pNorm] : null;
         if (!parent) break;
-        if (!filled.ownerName && parent.ownerName) filled.ownerName = parent.ownerName;
-        if (!filled.icpTier && parent.icpTier) filled.icpTier = parent.icpTier;
-        if (!filled.category && parent.category) filled.category = parent.category;
+        if (parent.ownerName) filled.ownerName = parent.ownerName;
         cursor = parent;
         hops++;
       }

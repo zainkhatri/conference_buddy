@@ -61,13 +61,13 @@ def fetch_hubspot_data():
         for o in r.json().get("results", []):
             owner_map[o["id"]] = f"{o.get('firstName','')} {o.get('lastName','')}".strip()
 
-    # Fetch all companies
+    # Fetch all companies (parent relationship is an ASSOCIATION, not a property)
     hs_map = {}  # normalized name → entry
     hs_id_map = {}  # company id → entry
     hs_domain_map = {}  # normalized domain → entry
     after = None
     while True:
-        url = f"https://api.hubapi.com/crm/v3/objects/companies?limit=100&properties=name,domain,hubspot_owner_id,parent_company_id,lifecyclestage,hs_lead_status,icp_tier,category"
+        url = f"https://api.hubapi.com/crm/v3/objects/companies?limit=100&associations=companies&properties=name,domain,hubspot_owner_id,lifecyclestage,hs_lead_status,icp_tier,category"
         if after: url += f"&after={after}"
         r = req.get(url, headers=headers)
         if not r.ok: break
@@ -75,10 +75,16 @@ def fetch_hubspot_data():
         for co in data.get("results", []):
             props = co.get("properties", {})
             name = props.get("name", "")
+            # Parent id via HubSpot association `child_to_parent_company`
+            parent_id = ""
+            for a in co.get("associations", {}).get("companies", {}).get("results", []):
+                if a.get("type") == "child_to_parent_company":
+                    parent_id = a.get("id", "")
+                    break
             entry = {
                 "ownerName": owner_map.get(props.get("hubspot_owner_id", ""), ""),
                 "id": co["id"],
-                "parentId": props.get("parent_company_id", ""),
+                "parentId": parent_id,
                 "lifecycle": (props.get("lifecyclestage", "") or "").lower(),
                 "leadStatus": (props.get("hs_lead_status", "") or "").lower(),
                 "icpTier": (props.get("icp_tier", "") or "").lower(),
@@ -120,18 +126,19 @@ def resolve_parent(entry, hs_id_map, depth=0):
     return entry
 
 def resolve_with_inheritance(entry, hs_id_map, depth=0):
-    """Return an entry with missing ownerName/icpTier/category filled from the parent chain.
+    """Fill missing ownerName from the parent chain (subsidiaries often share BDR ownership).
+    Intentionally does NOT inherit category or icpTier — those are per-company in the CRM and
+    parent/child are often different business types (e.g., a TPA subsidiary of a broker).
     Child's own non-empty values always win."""
     if not entry or depth > 3: return entry
     filled = dict(entry)
-    if filled.get("ownerName") and filled.get("icpTier") and filled.get("category"):
+    if filled.get("ownerName"):
         return filled
     pid = filled.get("parentId")
     if pid and pid in hs_id_map:
         parent = resolve_with_inheritance(hs_id_map[pid], hs_id_map, depth + 1)
-        for k in ("ownerName", "icpTier", "category"):
-            if not filled.get(k) and parent.get(k):
-                filled[k] = parent[k]
+        if not filled.get("ownerName") and parent.get("ownerName"):
+            filled["ownerName"] = parent["ownerName"]
     return filled
 
 def writeback_hubspot_categories(updates, log_fn=None):
