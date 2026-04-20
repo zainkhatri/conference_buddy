@@ -32,10 +32,26 @@ def normalize_company(s):
     s = re.sub(r'[^a-z0-9]', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
+def normalize_domain(d):
+    if not d: return ""
+    d = d.strip().lower()
+    d = re.sub(r'^https?://', '', d)
+    d = re.sub(r'^www\.', '', d)
+    return d.split('/', 1)[0]
+
+def _token_prefix_match(a, b):
+    """True if a == b, or the shorter is a whole-word prefix of the longer (space boundary).
+    Requires the shorter to be at least 6 chars to reject generic short names."""
+    if not a or not b: return False
+    if a == b: return True
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    if len(shorter) < 6: return False
+    return longer.startswith(shorter + " ")
+
 # ─── HubSpot Enrichment ───
 def fetch_hubspot_data():
     if not HUBSPOT_TOKEN:
-        return {}, {}
+        return {}, {}, {}
     headers = {"Authorization": f"Bearer {HUBSPOT_TOKEN}"}
 
     # Fetch owners
@@ -48,9 +64,10 @@ def fetch_hubspot_data():
     # Fetch all companies
     hs_map = {}  # normalized name → entry
     hs_id_map = {}  # company id → entry
+    hs_domain_map = {}  # normalized domain → entry
     after = None
     while True:
-        url = f"https://api.hubapi.com/crm/v3/objects/companies?limit=100&properties=name,hubspot_owner_id,parent_company_id,lifecyclestage,hs_lead_status"
+        url = f"https://api.hubapi.com/crm/v3/objects/companies?limit=100&properties=name,domain,hubspot_owner_id,parent_company_id,lifecyclestage,hs_lead_status,icp_tier,category"
         if after: url += f"&after={after}"
         r = req.get(url, headers=headers)
         if not r.ok: break
@@ -64,24 +81,33 @@ def fetch_hubspot_data():
                 "parentId": props.get("parent_company_id", ""),
                 "lifecycle": (props.get("lifecyclestage", "") or "").lower(),
                 "leadStatus": (props.get("hs_lead_status", "") or "").lower(),
+                "icpTier": (props.get("icp_tier", "") or "").lower(),
+                "category": (props.get("category", "") or "").strip(),
+                "domain": normalize_domain(props.get("domain", "")),
             }
             norm = normalize_company(name)
             if norm: hs_map[norm] = entry
             hs_id_map[co["id"]] = entry
+            if entry["domain"]: hs_domain_map[entry["domain"]] = entry
         paging = data.get("paging", {}).get("next", {})
         after = paging.get("after")
         if not after: break
 
-    return hs_map, hs_id_map
+    return hs_map, hs_id_map, hs_domain_map
 
-def lookup_hubspot(company, hs_map, hs_id_map):
+def lookup_hubspot(company, hs_map, hs_id_map, hs_domain_map=None, domain=""):
     norm = normalize_company(company)
+    # 1. Exact normalized-name match (most specific — preserves subsidiary granularity)
+    if norm and norm in hs_map: return hs_map[norm]
+    # 2. Domain match (deterministic — good fallback when name varies)
+    if domain and hs_domain_map:
+        nd = normalize_domain(domain)
+        if nd and nd in hs_domain_map:
+            return hs_domain_map[nd]
     if not norm: return None
-    # Exact match
-    if norm in hs_map: return hs_map[norm]
-    # Partial match
+    # 3. Whole-token prefix match (rejects generic substring overlaps)
     for key, entry in hs_map.items():
-        if len(key) > 3 and (norm in key or key in norm):
+        if _token_prefix_match(norm, key):
             return entry
     return None
 
@@ -92,6 +118,50 @@ def resolve_parent(entry, hs_id_map, depth=0):
     if pid and pid in hs_id_map:
         return resolve_parent(hs_id_map[pid], hs_id_map, depth+1)
     return entry
+
+def resolve_with_inheritance(entry, hs_id_map, depth=0):
+    """Return an entry with missing ownerName/icpTier/category filled from the parent chain.
+    Child's own non-empty values always win."""
+    if not entry or depth > 3: return entry
+    filled = dict(entry)
+    if filled.get("ownerName") and filled.get("icpTier") and filled.get("category"):
+        return filled
+    pid = filled.get("parentId")
+    if pid and pid in hs_id_map:
+        parent = resolve_with_inheritance(hs_id_map[pid], hs_id_map, depth + 1)
+        for k in ("ownerName", "icpTier", "category"):
+            if not filled.get(k) and parent.get(k):
+                filled[k] = parent[k]
+    return filled
+
+def writeback_hubspot_categories(updates, log_fn=None):
+    """PATCH HubSpot companies in batch with a new `category`.
+    updates: dict of {company_id: hubspot_category_value}. Returns (ok_count, fail_count)."""
+    if not updates or not HUBSPOT_TOKEN:
+        return 0, 0
+    headers = {"Authorization": f"Bearer {HUBSPOT_TOKEN}", "Content-Type": "application/json"}
+    ok, fail = 0, 0
+    items = list(updates.items())
+    # HubSpot batch endpoint accepts up to 100 inputs per request
+    for b in range(0, len(items), 100):
+        chunk = items[b:b+100]
+        payload = {"inputs": [{"id": cid, "properties": {"category": cat}} for cid, cat in chunk]}
+        try:
+            r = req.post("https://api.hubapi.com/crm/v3/objects/companies/batch/update",
+                         headers=headers, json=payload, timeout=30)
+            if r.ok:
+                ok += len(chunk)
+                # Refresh cache entries so in-memory map reflects the write
+                for cid, cat in chunk:
+                    if cid in _hs_cache["id_map"]:
+                        _hs_cache["id_map"][cid]["category"] = cat
+            else:
+                fail += len(chunk)
+                if log_fn: log_fn(f"HubSpot writeback {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            fail += len(chunk)
+            if log_fn: log_fn(f"HubSpot writeback error: {e}")
+    return ok, fail
 
 def format_relationship(entry):
     if not entry: return ""
@@ -110,14 +180,15 @@ def format_relationship(entry):
     return "Known" if entry.get("ownerName") else ""
 
 # ─── HubSpot Cache (fetch once at startup, refresh every 30 min) ───
-_hs_cache = {"map": {}, "id_map": {}, "ts": 0}
+_hs_cache = {"map": {}, "id_map": {}, "domain_map": {}, "ts": 0}
 def get_hubspot_cached():
     if time.time() - _hs_cache["ts"] > 1800:  # 30 min
-        m, im = fetch_hubspot_data()
+        m, im, dm = fetch_hubspot_data()
         _hs_cache["map"] = m
         _hs_cache["id_map"] = im
+        _hs_cache["domain_map"] = dm
         _hs_cache["ts"] = time.time()
-    return _hs_cache["map"], _hs_cache["id_map"]
+    return _hs_cache["map"], _hs_cache["id_map"], _hs_cache["domain_map"]
 
 # ─── Apollo Enrichment ───
 def apollo_match(row, domain_cache):
@@ -423,6 +494,17 @@ SENIOR = {"C-Suite / Founder", "EVP / SVP", "VP / AVP", "Director / Head"}
 # Carrier / MGA / Broker / Reinsurer are ICP buyers for FurtherAI.
 ICP_FOR_PRIORITY = {"Insurance Carrier", "MGA / Specialty Underwriter", "Insurance Broker", "Reinsurer"}
 
+# Map HubSpot `category` property (set by hubspot-cleanup) → Conference Buddy Company Type.
+HS_CATEGORY_TO_TYPE = {
+    "Carrier": "Insurance Carrier",
+    "MGA/MGU": "MGA / Specialty Underwriter",
+    "Brokerage": "Insurance Broker",
+    "Reinsurer": "Reinsurer",
+    "Insurtech": "InsurTech / Technology",
+}
+# Reverse map — for writing Conference Buddy classifications back to HubSpot's `category` property.
+TYPE_TO_HS_CATEGORY = {v: k for k, v in HS_CATEGORY_TO_TYPE.items()}
+
 def detect_seniority(title):
     t = (title or "").lower()
     if re.search(r'\b(evp|svp)\b', t) or "executive vice president" in t or "senior vice president" in t: return "EVP / SVP"
@@ -433,7 +515,11 @@ def detect_seniority(title):
     if re.search(r'\b(analyst|specialist|coordinator|associate|adjuster|underwriter|account executive|producer)\b', t): return "Analyst / Specialist"
     return "Other"
 
-def compute_icp(company_type, seniority, title, status):
+def compute_icp(company_type, seniority, title, status, hs_tier=""):
+    # HubSpot-level hard override: company was already classified Disqualified by the CRM cleanup.
+    if (hs_tier or "").lower() == "disqualified":
+        return "None", "4 - Do Not Contact", "HubSpot: Disqualified company", ""
+
     fit, prio, reason, angle = _compute_icp_raw(company_type, seniority, title, status)
     # ICP filter: non-ICP Company Types cannot hold Priority 1 or 2.
     if company_type not in ICP_FOR_PRIORITY and prio in ("1 - Priority", "2 - Warm"):
@@ -654,8 +740,8 @@ def process_csv(csv_text, filename, progress_fn=None):
 
     # ── Step 1: HubSpot lookup (cached) ──
     log(f"Loading HubSpot data...")
-    hs_map, hs_id_map = get_hubspot_cached()
-    log(f"HubSpot: {len(hs_map)} companies")
+    hs_map, hs_id_map, hs_domain_map = get_hubspot_cached()
+    log(f"HubSpot: {len(hs_map)} companies ({len(hs_domain_map)} with domain)")
 
     # ── Step 2: Apollo enrichment (skip rows that already have email + phone) ──
     domain_cache = {}
@@ -675,11 +761,16 @@ def process_csv(csv_text, filename, progress_fn=None):
     unassigned_idx = 0
     for r in data:
         company = r.get("Company", "")
-        hs_entry = lookup_hubspot(company, hs_map, hs_id_map)
+        norm_co = normalize_company(company)
+        domain = domain_cache.get(norm_co, "") if APOLLO_API_KEY else ""
+        hs_entry = lookup_hubspot(company, hs_map, hs_id_map, hs_domain_map, domain)
         if hs_entry:
-            hs_entry = resolve_parent(hs_entry, hs_id_map)
+            hs_entry = resolve_with_inheritance(hs_entry, hs_id_map)
         r["HubSpot Status"] = format_relationship(hs_entry)
         r["HubSpot Owner"] = hs_entry.get("ownerName", "") if hs_entry else ""
+        r["_hs_icp_tier"] = hs_entry.get("icpTier", "") if hs_entry else ""
+        r["_hs_category"] = hs_entry.get("category", "") if hs_entry else ""
+        r["_hs_id"] = hs_entry.get("id", "") if hs_entry else ""
 
         # Pod assignment from HubSpot owner
         owner = r["HubSpot Owner"]
@@ -743,6 +834,14 @@ def process_csv(csv_text, filename, progress_fn=None):
         # Known company override
         known = classify_known(r.get("Company", ""))
         if known: r["Company Type"] = known
+        # HubSpot category override (from cleanup-authored `category` property)
+        if not r.get("Company Type", "").strip():
+            hs_cat = (r.get("_hs_category", "") or "").strip()
+            # Case-insensitive lookup against HS_CATEGORY_TO_TYPE
+            for src_cat, dst_type in HS_CATEGORY_TO_TYPE.items():
+                if hs_cat.lower() == src_cat.lower():
+                    r["Company Type"] = dst_type
+                    break
 
     # Claude classification for rows still missing company type
     needs_claude = [r for r in data if not r.get("Company Type", "").strip()]
@@ -760,6 +859,24 @@ def process_csv(csv_text, filename, progress_fn=None):
         if not r.get("Company Type", "").strip():
             r["Company Type"] = "Corporate / End-User"
 
+    # ── Step 4b: Write classifications back to HubSpot (close the loop) ──
+    # Safe because TYPE_TO_HS_CATEGORY only maps the 5 insurance buckets — non-insurance
+    # Claude classifications (Corporate, TPA, Academic, etc.) can't produce a writeback target.
+    # Skip only Disqualified companies (cleanup already marked them not-insurance).
+    writeback = {}
+    for r in data:
+        hs_id = r.get("_hs_id", "")
+        hs_cat = (r.get("_hs_category", "") or "").strip()
+        hs_tier = (r.get("_hs_icp_tier", "") or "").lower()
+        ct = r.get("Company Type", "")
+        hs_target = TYPE_TO_HS_CATEGORY.get(ct)
+        if hs_id and not hs_cat and hs_tier != "disqualified" and hs_target:
+            writeback[hs_id] = hs_target
+    if writeback:
+        log(f"HubSpot writeback: {len(writeback)} companies missing category")
+        ok, fail = writeback_hubspot_categories(writeback, log)
+        log(f"HubSpot writeback: {ok} updated, {fail} failed")
+
     # ── Step 5: Seniority + ICP ──
     log("Computing ICP tiers...")
     for r in data:
@@ -769,7 +886,7 @@ def process_csv(csv_text, filename, progress_fn=None):
         r["Seniority"] = seniority
         status = r.get("HubSpot Status", "").strip()
 
-        icp_fit, prio, reason, angle = compute_icp(ct, seniority, title, status)
+        icp_fit, prio, reason, angle = compute_icp(ct, seniority, title, status, r.get("_hs_icp_tier", ""))
         r["ICP Fit"] = icp_fit
         r["Outreach Priority"] = prio
         r["ICP Reason"] = reason
@@ -939,8 +1056,8 @@ def handle_message(event):
 if __name__ == "__main__":
     print("Conference Buddy bot starting...")
     print("Pre-fetching HubSpot data...")
-    m, im = get_hubspot_cached()
-    print(f"HubSpot loaded: {len(m)} companies")
+    m, im, dm = get_hubspot_cached()
+    print(f"HubSpot loaded: {len(m)} companies ({len(dm)} with domain)")
     print("Ready!")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
